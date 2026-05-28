@@ -34,9 +34,23 @@ PLANS = {
 
 GUMROAD_PRODUCT_URLS = {
     "starter": "https://sudnyk.gumroad.com/l/zdmyrh",
-    "pro": "",
-    "studio": "",
+    "pro": os.getenv("GUMROAD_PRO_URL", ""),
+    "studio": os.getenv("GUMROAD_STUDIO_URL", ""),
+
+    # One-time AI credit top-up products.
+    # Add these URLs in Render Environment Variables after creating Gumroad products:
+    # CREDITS_1000_URL, CREDITS_5000_URL, CREDITS_15000_URL
+    "credits_1000": os.getenv("CREDITS_1000_URL", ""),
+    "credits_5000": os.getenv("CREDITS_5000_URL", ""),
+    "credits_15000": os.getenv("CREDITS_15000_URL", ""),
 }
+
+CREDIT_PACKS = {
+    "credits_1000": 1000,
+    "credits_5000": 5000,
+    "credits_15000": 15000,
+}
+
 
 AI_COSTS = {
     "generate_title": 1,
@@ -270,12 +284,82 @@ def license_status(req: TrialRequest):
 @app.post("/billing/create-checkout")
 def create_checkout(req: CheckoutRequest):
     plan = req.plan.lower().strip()
-    if plan not in ["starter", "pro", "studio"]:
-        raise HTTPException(status_code=400, detail="Invalid plan")
+
+    allowed_products = ["starter", "pro", "studio", "credits_1000", "credits_5000", "credits_15000"]
+
+    if plan not in allowed_products:
+        raise HTTPException(status_code=400, detail="Invalid product")
+
     url = GUMROAD_PRODUCT_URLS.get(plan)
+
     if not url:
-        raise HTTPException(status_code=400, detail=f"Gumroad URL for {plan} is not configured in backend.")
-    return {"checkout_url": url}
+        raise HTTPException(
+            status_code=400,
+            detail=f"Gumroad URL for {plan} is not configured in backend."
+        )
+
+    return {"checkout_url": url, "product": plan}
+
+
+def detect_credit_pack(product_name: str):
+    name = (product_name or "").lower()
+
+    if "credit" not in name and "credits" not in name:
+        return None, 0
+
+    if "15000" in name or "15,000" in name:
+        return "credits_15000", 15000
+
+    if "5000" in name or "5,000" in name:
+        return "credits_5000", 5000
+
+    if "1000" in name or "1,000" in name:
+        return "credits_1000", 1000
+
+    return None, 0
+
+
+def add_credit_pack_to_license(email: str, add_credits: int, sale_id: str):
+    existing = get_license_by_email(email)
+
+    if not existing:
+        return {
+            "status": "no_license_for_credit_pack",
+            "email": email,
+            "message": "Credit packs require an existing trial or subscription license."
+        }
+
+    # Basic duplicate protection: if Gumroad retries the same sale_id, do not add credits twice.
+    if sale_id and existing.get("gumroad_sale_id") == sale_id:
+        return {
+            "status": "already_processed",
+            "email": email,
+            "credits_left": existing.get("ai_credits", 0),
+            "sale_id": sale_id,
+        }
+
+    current_credits = int(existing.get("ai_credits") or 0)
+    new_credits = current_credits + int(add_credits)
+
+    update_data = {
+        "ai_credits": new_credits,
+        "gumroad_sale_id": sale_id,
+        "last_payment_at": iso(now_utc()),
+    }
+
+    if existing.get("id"):
+        supabase.table("licenses").update(update_data).eq("id", existing["id"]).execute()
+    else:
+        supabase.table("licenses").update(update_data).eq("email", email).execute()
+
+    return {
+        "status": "credits_added",
+        "email": email,
+        "added_credits": add_credits,
+        "credits_left": new_credits,
+        "sale_id": sale_id,
+    }
+
 
 
 @app.post("/webhooks/gumroad")
@@ -286,8 +370,25 @@ async def gumroad_webhook(request: Request):
     email = str(data.get("email", "")).lower().strip()
     product_name = str(data.get("product_name", "")).lower().strip()
     subscription_id = str(data.get("subscription_id", "")).strip()
+    sale_id = str(data.get("sale_id", "")).strip()
     refunded = str(data.get("refunded", "false")).lower() == "true"
     disputed = str(data.get("disputed", "false")).lower() == "true"
+
+    if not email:
+        return {"status": "missing_email"}
+
+    credit_pack_key, add_credits = detect_credit_pack(product_name)
+
+    if credit_pack_key:
+        if refunded or disputed:
+            return {
+                "status": "credit_pack_refund_or_dispute_received",
+                "email": email,
+                "credit_pack": credit_pack_key,
+            }
+
+        return add_credit_pack_to_license(email, add_credits, sale_id)
+
     if "starter" in product_name:
         plan_name = "starter"
     elif "pro" in product_name:
@@ -315,7 +416,7 @@ async def gumroad_webhook(request: Request):
         "ai_credits": plan["ai_credits"],
         "gumroad_subscription_id": subscription_id,
         "gumroad_product_name": data.get("product_name"),
-        "gumroad_sale_id": data.get("sale_id"),
+        "gumroad_sale_id": sale_id,
         "last_payment_at": iso(now_utc()),
     }
     if existing:
