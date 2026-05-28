@@ -142,6 +142,25 @@ def build_status(record):
     }
 
 
+
+def calculate_new_expiration(existing_record, plan_days):
+    """
+    Extends subscription correctly:
+    - if current expires_at is still in the future, add days to that date;
+    - if expired or missing, start from now.
+    """
+    base = now_utc()
+
+    if existing_record and existing_record.get("expires_at"):
+        try:
+            current_exp = parse_datetime(existing_record.get("expires_at"))
+            if current_exp.timestamp() > base.timestamp():
+                base = current_exp
+        except Exception:
+            pass
+
+    return base + timedelta(days=plan_days)
+
 def update_license_credits(record, new_credits):
     # Prefer id when available; otherwise update by hardware_id.
     if record.get("id"):
@@ -285,7 +304,7 @@ async def gumroad_webhook(request: Request):
             supabase.table("licenses").update({"is_active": False, "plan": "expired"}).eq("email", email).execute()
         return {"status": "blocked_refund_or_dispute", "email": email}
     plan = PLANS[plan_name]
-    expires = now_utc() + timedelta(days=plan["days"])
+    expires = calculate_new_expiration(existing, plan["days"])
     update_data = {
         "email": email,
         "plan": plan_name,
@@ -297,6 +316,7 @@ async def gumroad_webhook(request: Request):
         "gumroad_subscription_id": subscription_id,
         "gumroad_product_name": data.get("product_name"),
         "gumroad_sale_id": data.get("sale_id"),
+        "last_payment_at": iso(now_utc()),
     }
     if existing:
         supabase.table("licenses").update(update_data).eq("email", email).execute()
@@ -305,7 +325,7 @@ async def gumroad_webhook(request: Request):
         update_data["license_key"] = "GUM-" + str(uuid.uuid4()).split("-")[0].upper()
         update_data["is_trial_used"] = True
         supabase.table("licenses").insert(update_data).execute()
-    return {"status": "ok", "email": email, "plan": plan_name}
+    return {"status": "ok", "email": email, "plan": plan_name, "expires_at": iso(expires)}
 
 
 @app.get("/payment-success")
