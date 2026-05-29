@@ -164,6 +164,65 @@ def get_license_by_key(license_key: str):
     return choose_best_record(result.data or [])
 
 
+
+def get_best_license_for_status(email: str = "", hardware_id: str = "", license_key: str = ""):
+    """
+    Status lookup must not let a trial hardware_id override a paid email license.
+    It collects all possible matching records and chooses the best by:
+    active/not expired, plan priority, credits.
+    Priority: studio > pro > starter > trial.
+    """
+    records = []
+
+    email = (email or "").lower().strip()
+    hardware_id = (hardware_id or "").strip()
+    license_key = (license_key or "").strip()
+
+    try:
+        if email:
+            res = supabase.table("licenses").select("*").eq("email", email).execute()
+            records.extend(res.data or [])
+    except Exception:
+        pass
+
+    try:
+        if hardware_id:
+            res = supabase.table("licenses").select("*").eq("hardware_id", hardware_id).execute()
+            records.extend(res.data or [])
+    except Exception:
+        pass
+
+    try:
+        if license_key:
+            res = supabase.table("licenses").select("*").eq("license_key", license_key).execute()
+            records.extend(res.data or [])
+    except Exception:
+        pass
+
+    # Deduplicate by id when possible, otherwise by email/hardware/plan/expires.
+    deduped = []
+    seen = set()
+
+    for record in records:
+        key = record.get("id") or (
+            record.get("email"),
+            record.get("hardware_id"),
+            record.get("plan"),
+            record.get("expires_at"),
+        )
+
+        key = str(key)
+
+        if key in seen:
+            continue
+
+        seen.add(key)
+        deduped.append(record)
+
+    return choose_best_record(deduped)
+
+
+
 def build_status(record):
     expires_at = record.get("expires_at")
     expired = False
@@ -354,9 +413,18 @@ def start_trial(req: TrialRequest):
 
 @app.post("/license/status")
 def license_status(req: TrialRequest):
-    record = get_license_by_hardware(req.hardware_id)
+    # IMPORTANT:
+    # If both email and hardware_id are present, choose the best license.
+    # This prevents an old trial hardware record from overriding a paid email license.
+    record = get_best_license_for_status(
+        email=getattr(req, "email", ""),
+        hardware_id=getattr(req, "hardware_id", ""),
+        license_key=getattr(req, "license_key", "")
+    )
+
     if not record:
         return start_trial(req)
+
     return build_status(record)
 
 
