@@ -64,7 +64,9 @@ PLAN_PRIORITY = {"studio": 4, "pro": 3, "starter": 2, "trial": 1, None: 0, "": 0
 
 
 class TrialRequest(BaseModel):
-    hardware_id: str
+    hardware_id: str = ""
+    email: Optional[str] = ""
+    license_key: Optional[str] = ""
 
 
 class CheckoutRequest(BaseModel):
