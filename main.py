@@ -14,6 +14,7 @@ load_dotenv()
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
+ADMIN_SECRET_KEY = os.getenv("ADMIN_SECRET_KEY", "").strip()
 
 if not SUPABASE_URL:
     raise RuntimeError("SUPABASE_URL is missing in .env")
@@ -69,6 +70,35 @@ class TrialRequest(BaseModel):
 class CheckoutRequest(BaseModel):
     hardware_id: str
     plan: str
+
+
+class AdminGrantPlanRequest(BaseModel):
+    admin_secret: str
+    email: str
+    plan: str
+    hardware_id: str = ""
+    days: int = 30
+    ai_credits: int | None = None
+
+
+class AdminAddCreditsRequest(BaseModel):
+    admin_secret: str
+    email: str
+    credits: int
+
+
+class AdminExtendLicenseRequest(BaseModel):
+    admin_secret: str
+    email: str
+    days: int
+
+
+class AdminDisableLicenseRequest(BaseModel):
+    admin_secret: str
+    email: str
+    reason: str = "manual_admin_disable"
+
+
 
 
 class AIRequest(BaseModel):
@@ -249,6 +279,55 @@ def home():
     return {"status": "Stream Studio Backend is running"}
 
 
+
+def require_admin_secret(admin_secret: str):
+    if not ADMIN_SECRET_KEY:
+        raise HTTPException(
+            status_code=500,
+            detail="ADMIN_SECRET_KEY is not configured on backend."
+        )
+
+    if not admin_secret or admin_secret != ADMIN_SECRET_KEY:
+        raise HTTPException(
+            status_code=403,
+            detail="Invalid admin secret."
+        )
+
+
+def normalize_email(email: str):
+    email = (email or "").lower().strip()
+    if not email or "@" not in email:
+        raise HTTPException(status_code=400, detail="Valid email is required.")
+    return email
+
+
+def normalize_plan(plan: str):
+    plan = (plan or "").lower().strip()
+    if plan not in PLANS:
+        raise HTTPException(status_code=400, detail=f"Invalid plan: {plan}")
+    return plan
+
+
+def get_plan_default_credits(plan: str):
+    plan_config = PLANS.get(plan, {})
+    return int(plan_config.get("ai_credits", 0) or 0)
+
+
+def admin_get_license_by_email_or_error(email: str):
+    record = get_license_by_email(email)
+    if not record:
+        raise HTTPException(status_code=404, detail=f"No license found for {email}")
+    return record
+
+
+def update_license_by_existing_record(existing: dict, update_data: dict):
+    if existing.get("id"):
+        supabase.table("licenses").update(update_data).eq("id", existing["id"]).execute()
+    else:
+        supabase.table("licenses").update(update_data).eq("email", existing["email"]).execute()
+
+
+
 @app.post("/trial/start")
 def start_trial(req: TrialRequest):
     existing = get_license_by_hardware(req.hardware_id)
@@ -279,6 +358,170 @@ def license_status(req: TrialRequest):
     if not record:
         return start_trial(req)
     return build_status(record)
+
+
+
+@app.post("/admin/grant-plan")
+def admin_grant_plan(req: AdminGrantPlanRequest):
+    require_admin_secret(req.admin_secret)
+
+    email = normalize_email(req.email)
+    plan = normalize_plan(req.plan)
+
+    days = int(req.days or 30)
+    if days <= 0:
+        raise HTTPException(status_code=400, detail="days must be greater than 0")
+
+    plan_config = PLANS[plan]
+    existing = get_license_by_email(email)
+
+    now = now_utc()
+    expires_at = now + timedelta(days=days)
+
+    if req.ai_credits is None:
+        credits = get_plan_default_credits(plan)
+    else:
+        credits = int(req.ai_credits)
+        if credits < 0:
+            raise HTTPException(status_code=400, detail="ai_credits cannot be negative")
+
+    license_key = f"ADMIN-{plan.upper()}-{uuid.uuid4().hex[:12].upper()}"
+
+    data = {
+        "email": email,
+        "license_key": license_key,
+        "plan": plan,
+        "hardware_id": req.hardware_id or (existing.get("hardware_id") if existing else ""),
+        "expires_at": iso(expires_at),
+        "is_active": True,
+        "ai_credits": credits,
+        "max_channels": int(plan_config.get("max_channels", 1)),
+        "max_streams": int(plan_config.get("max_streams", 1)),
+        "gumroad_subscription_id": f"MANUAL-{uuid.uuid4().hex[:10].upper()}",
+        "gumroad_sale_id": f"ADMIN-GRANT-{uuid.uuid4().hex[:10].upper()}",
+        "last_payment_at": iso(now),
+    }
+
+    if existing:
+        update_license_by_existing_record(existing, data)
+        action = "updated_existing_license"
+    else:
+        supabase.table("licenses").insert(data).execute()
+        action = "created_new_license"
+
+    return {
+        "status": "ok",
+        "action": action,
+        "email": email,
+        "plan": plan,
+        "expires_at": data["expires_at"],
+        "ai_credits": credits,
+        "max_channels": data["max_channels"],
+        "max_streams": data["max_streams"],
+    }
+
+
+@app.post("/admin/add-credits")
+def admin_add_credits(req: AdminAddCreditsRequest):
+    require_admin_secret(req.admin_secret)
+
+    email = normalize_email(req.email)
+    credits_to_add = int(req.credits)
+
+    if credits_to_add <= 0:
+        raise HTTPException(status_code=400, detail="credits must be greater than 0")
+
+    existing = admin_get_license_by_email_or_error(email)
+
+    current_credits = int(existing.get("ai_credits") or 0)
+    new_credits = current_credits + credits_to_add
+
+    update_data = {
+        "ai_credits": new_credits,
+        "gumroad_sale_id": f"ADMIN-CREDITS-{uuid.uuid4().hex[:10].upper()}",
+        "last_payment_at": iso(now_utc()),
+    }
+
+    update_license_by_existing_record(existing, update_data)
+
+    return {
+        "status": "ok",
+        "email": email,
+        "added_credits": credits_to_add,
+        "previous_credits": current_credits,
+        "credits_left": new_credits,
+    }
+
+
+@app.post("/admin/extend-license")
+def admin_extend_license(req: AdminExtendLicenseRequest):
+    require_admin_secret(req.admin_secret)
+
+    email = normalize_email(req.email)
+    days = int(req.days)
+
+    if days <= 0:
+        raise HTTPException(status_code=400, detail="days must be greater than 0")
+
+    existing = admin_get_license_by_email_or_error(email)
+
+    old_expires = existing.get("expires_at")
+    base_time = now_utc()
+
+    if old_expires:
+        try:
+            parsed = datetime.fromisoformat(str(old_expires).replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            if parsed > base_time:
+                base_time = parsed
+        except Exception:
+            pass
+
+    new_expires = base_time + timedelta(days=days)
+
+    update_data = {
+        "expires_at": iso(new_expires),
+        "is_active": True,
+        "gumroad_sale_id": f"ADMIN-EXTEND-{uuid.uuid4().hex[:10].upper()}",
+        "last_payment_at": iso(now_utc()),
+    }
+
+    update_license_by_existing_record(existing, update_data)
+
+    return {
+        "status": "ok",
+        "email": email,
+        "plan": existing.get("plan"),
+        "old_expires_at": old_expires,
+        "new_expires_at": update_data["expires_at"],
+        "added_days": days,
+    }
+
+
+@app.post("/admin/disable-license")
+def admin_disable_license(req: AdminDisableLicenseRequest):
+    require_admin_secret(req.admin_secret)
+
+    email = normalize_email(req.email)
+    existing = admin_get_license_by_email_or_error(email)
+
+    update_data = {
+        "is_active": False,
+        "gumroad_sale_id": f"ADMIN-DISABLE-{uuid.uuid4().hex[:10].upper()}",
+        "last_payment_at": iso(now_utc()),
+    }
+
+    update_license_by_existing_record(existing, update_data)
+
+    return {
+        "status": "ok",
+        "email": email,
+        "plan": existing.get("plan"),
+        "is_active": False,
+        "reason": req.reason,
+    }
+
 
 
 @app.post("/billing/create-checkout")
