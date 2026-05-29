@@ -490,6 +490,7 @@ def admin_grant_plan(req: AdminGrantPlanRequest):
         "status": "ok",
         "action": action,
         "email": email,
+        "license_key": data["license_key"],
         "plan": plan,
         "expires_at": data["expires_at"],
         "ai_credits": credits,
