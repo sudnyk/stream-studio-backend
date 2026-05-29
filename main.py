@@ -253,6 +253,7 @@ def build_status(record):
         "credits_left": record.get("ai_credits", 0),
         "email": record.get("email"),
         "hardware_id": record.get("hardware_id"),
+        "license_key": record.get("license_key"),
     }
 
 
@@ -284,12 +285,14 @@ def update_license_credits(record, new_credits):
 
 
 def get_ai_license(req: AIRequest):
-    if req.hardware_id:
-        record = get_license_by_hardware(req.hardware_id)
-        if record:
-            return record
+    # IMPORTANT: paid license key must have priority over hardware_id.
+    # Otherwise AI generation can charge an old local trial record instead of the paid Starter/Pro/Studio license.
     if req.license_key:
         record = get_license_by_key(req.license_key)
+        if record:
+            return record
+    if req.hardware_id:
+        record = get_license_by_hardware(req.hardware_id)
         if record:
             return record
     return None
