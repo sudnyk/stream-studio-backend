@@ -99,6 +99,15 @@ class AdminDisableLicenseRequest(BaseModel):
     reason: str = "manual_admin_disable"
 
 
+class AdminResetHardwareRequest(BaseModel):
+    admin_secret: str
+    hardware_id: str
+    delete_records: bool = True
+    reason: str = "manual_trial_reset"
+
+
+
+
 
 
 class AIRequest(BaseModel):
@@ -587,6 +596,58 @@ def admin_disable_license(req: AdminDisableLicenseRequest):
         "email": email,
         "plan": existing.get("plan"),
         "is_active": False,
+        "reason": req.reason,
+    }
+
+
+
+
+@app.post("/admin/reset-license-by-hardware")
+def admin_reset_license_by_hardware(req: AdminResetHardwareRequest):
+    require_admin_secret(req.admin_secret)
+
+    hardware_id = (req.hardware_id or "").strip()
+    if not hardware_id:
+        raise HTTPException(status_code=400, detail="hardware_id is required")
+
+    existing = supabase.table("licenses").select("*").eq("hardware_id", hardware_id).execute()
+    records = existing.data or []
+
+    if not records:
+        return {
+            "status": "ok",
+            "action": "nothing_found",
+            "hardware_id": hardware_id,
+            "deleted_or_disabled": 0,
+            "reason": req.reason,
+        }
+
+    count = 0
+
+    for record in records:
+        if req.delete_records:
+            if record.get("id"):
+                supabase.table("licenses").delete().eq("id", record["id"]).execute()
+            else:
+                supabase.table("licenses").delete().eq("hardware_id", hardware_id).execute()
+            count += 1
+        else:
+            update_data = {
+                "is_active": False,
+                "gumroad_sale_id": f"ADMIN-RESET-{uuid.uuid4().hex[:10].upper()}",
+                "last_payment_at": iso(now_utc()),
+            }
+            if record.get("id"):
+                supabase.table("licenses").update(update_data).eq("id", record["id"]).execute()
+            else:
+                supabase.table("licenses").update(update_data).eq("hardware_id", hardware_id).execute()
+            count += 1
+
+    return {
+        "status": "ok",
+        "action": "deleted_records" if req.delete_records else "disabled_records",
+        "hardware_id": hardware_id,
+        "deleted_or_disabled": count,
         "reason": req.reason,
     }
 
