@@ -370,7 +370,6 @@ def update_license_credits(record, new_credits):
     try:
         update_data = {
             "ai_credits": new_credits,
-            "last_ai_charge_at": iso(now_utc()),
         }
 
         # Prefer id when available. This is the safest because hardware_id/email can be duplicated.
