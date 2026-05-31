@@ -716,12 +716,19 @@ def admin_grant_plan(req: AdminGrantPlanRequest):
     now = now_utc()
     expires_at = now + timedelta(days=days)
 
+    # V15.2C FIX:
+    # When a user buys/upgrades a plan, plan credits must be ADDED to remaining credits,
+    # not replace them. Example: 457 current + 3000 Pro = 3457 total.
+    current_credits = int(existing.get("ai_credits") or 0) if existing else 0
+
     if req.ai_credits is None:
-        credits = get_plan_default_credits(plan)
+        credits_to_add = get_plan_default_credits(plan)
     else:
-        credits = int(req.ai_credits)
-        if credits < 0:
+        credits_to_add = int(req.ai_credits)
+        if credits_to_add < 0:
             raise HTTPException(status_code=400, detail="ai_credits cannot be negative")
+
+    credits = current_credits + credits_to_add
 
     license_key = f"ADMIN-{plan.upper()}-{uuid.uuid4().hex[:12].upper()}"
 
@@ -755,6 +762,9 @@ def admin_grant_plan(req: AdminGrantPlanRequest):
         "plan": plan,
         "expires_at": data["expires_at"],
         "ai_credits": credits,
+        "credits_before": current_credits,
+        "credits_added": credits_to_add,
+        "credits_after": credits,
         "max_channels": data["max_channels"],
         "max_streams": data["max_streams"],
     }
