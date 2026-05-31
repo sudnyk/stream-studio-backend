@@ -24,6 +24,50 @@ if not SUPABASE_SERVICE_KEY:
 
 supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 
+# DEV fallback is only for local development/testing.
+# When Supabase DNS/internet is unavailable, the backend will not crash.
+# Clean local fallback is Trial only: 1 channel, 3 streams, 30 AI credits.
+# For production on Render, set DEV_OFFLINE_LICENSE=false in environment variables.
+# Production-safe default: offline fallback is OFF unless you explicitly enable it in local .env.
+DEV_OFFLINE_LICENSE = os.getenv("DEV_OFFLINE_LICENSE", "false").strip().lower() in ("1", "true", "yes", "on")
+
+
+def make_dev_offline_license(hardware_id: str = "", email: str = "", license_key: str = ""):
+    """
+    Clean-client safe local fallback.
+
+    Important:
+    This fallback must NEVER unlock Studio/Pro features.
+    It only lets the desktop app open during local development if Supabase is offline.
+    Real paid plans must come only from Supabase / Gumroad / admin endpoints.
+    """
+    plan = PLANS["trial"]
+    expires = now_utc() + timedelta(days=plan["days"])
+    return {
+        "id": "DEV-OFFLINE-TRIAL",
+        "hardware_id": hardware_id or "DEV-HARDWARE",
+        "email": email or "",
+        "license_key": license_key or "DEV-OFFLINE-TRIAL",
+        "plan": "trial",
+        "expires_at": iso(expires),
+        "is_active": True,
+        "max_channels": plan["max_channels"],
+        "max_streams": plan["max_streams"],
+        "ai_credits": plan["ai_credits"],
+        "credits_left": plan["ai_credits"],
+        "dev_offline": True,
+        "clean_client_safe": True,
+    }
+
+
+def should_use_dev_offline_fallback():
+    return bool(DEV_OFFLINE_LICENSE)
+
+
+def log_supabase_error(place: str, error: Exception):
+    print(f"[SUPABASE OFFLINE] {place}: {error}")
+
+
 app = FastAPI(title="Stream Studio Backend")
 
 PLANS = {
@@ -161,18 +205,36 @@ def choose_best_record(records):
 
 
 def get_license_by_hardware(hardware_id: str):
-    result = supabase.table("licenses").select("*").eq("hardware_id", hardware_id).execute()
-    return choose_best_record(result.data or [])
+    try:
+        result = supabase.table("licenses").select("*").eq("hardware_id", hardware_id).execute()
+        return choose_best_record(result.data or [])
+    except Exception as e:
+        log_supabase_error("get_license_by_hardware", e)
+        if should_use_dev_offline_fallback():
+            return make_dev_offline_license(hardware_id=hardware_id)
+        raise
 
 
 def get_license_by_email(email: str):
-    result = supabase.table("licenses").select("*").eq("email", email).execute()
-    return choose_best_record(result.data or [])
+    try:
+        result = supabase.table("licenses").select("*").eq("email", email).execute()
+        return choose_best_record(result.data or [])
+    except Exception as e:
+        log_supabase_error("get_license_by_email", e)
+        if should_use_dev_offline_fallback():
+            return make_dev_offline_license(email=email)
+        raise
 
 
 def get_license_by_key(license_key: str):
-    result = supabase.table("licenses").select("*").eq("license_key", license_key).execute()
-    return choose_best_record(result.data or [])
+    try:
+        result = supabase.table("licenses").select("*").eq("license_key", license_key).execute()
+        return choose_best_record(result.data or [])
+    except Exception as e:
+        log_supabase_error("get_license_by_key", e)
+        if should_use_dev_offline_fallback():
+            return make_dev_offline_license(license_key=license_key)
+        raise
 
 
 
@@ -182,33 +244,48 @@ def get_best_license_for_status(email: str = "", hardware_id: str = "", license_
     It collects all possible matching records and chooses the best by:
     active/not expired, plan priority, credits.
     Priority: studio > pro > starter > trial.
+
+    Local DEV fallback:
+    If Supabase is temporarily unavailable, return a local offline Studio license
+    instead of crashing the backend with 500.
     """
     records = []
 
     email = (email or "").lower().strip()
     hardware_id = (hardware_id or "").strip()
     license_key = (license_key or "").strip()
+    supabase_failed = False
 
     try:
         if email:
             res = supabase.table("licenses").select("*").eq("email", email).execute()
             records.extend(res.data or [])
-    except Exception:
-        pass
+    except Exception as e:
+        supabase_failed = True
+        log_supabase_error("get_best_license_for_status/email", e)
 
     try:
         if hardware_id:
             res = supabase.table("licenses").select("*").eq("hardware_id", hardware_id).execute()
             records.extend(res.data or [])
-    except Exception:
-        pass
+    except Exception as e:
+        supabase_failed = True
+        log_supabase_error("get_best_license_for_status/hardware", e)
 
     try:
         if license_key:
             res = supabase.table("licenses").select("*").eq("license_key", license_key).execute()
             records.extend(res.data or [])
-    except Exception:
-        pass
+    except Exception as e:
+        supabase_failed = True
+        log_supabase_error("get_best_license_for_status/key", e)
+
+    if supabase_failed and not records and should_use_dev_offline_fallback():
+        return make_dev_offline_license(
+            hardware_id=hardware_id,
+            email=email,
+            license_key=license_key,
+        )
 
     # Deduplicate by id when possible, otherwise by email/hardware/plan/expires.
     deduped = []
@@ -231,7 +308,6 @@ def get_best_license_for_status(email: str = "", hardware_id: str = "", license_
         deduped.append(record)
 
     return choose_best_record(deduped)
-
 
 
 def build_status(record):
@@ -277,11 +353,99 @@ def calculate_new_expiration(existing_record, plan_days):
     return base + timedelta(days=plan_days)
 
 def update_license_credits(record, new_credits):
-    # Prefer id when available; otherwise update by hardware_id.
-    if record.get("id"):
-        supabase.table("licenses").update({"ai_credits": new_credits}).eq("id", record["id"]).execute()
-    else:
-        supabase.table("licenses").update({"ai_credits": new_credits}).eq("hardware_id", record["hardware_id"]).execute()
+    """
+    Store new AI credits in Supabase and return the updated license row when possible.
+
+    Important for V15.2:
+    The desktop app trusts credits_left returned by the backend.
+    So after charging we must update Supabase and then verify/read the new value back.
+    """
+    new_credits = int(new_credits)
+
+    # Offline DEV records are not stored in Supabase.
+    if record.get("dev_offline"):
+        record["ai_credits"] = new_credits
+        return record
+
+    try:
+        update_data = {
+            "ai_credits": new_credits,
+            "last_ai_charge_at": iso(now_utc()),
+        }
+
+        # Prefer id when available. This is the safest because hardware_id/email can be duplicated.
+        if record.get("id"):
+            result = (
+                supabase.table("licenses")
+                .update(update_data)
+                .eq("id", record["id"])
+                .execute()
+            )
+        elif record.get("license_key"):
+            result = (
+                supabase.table("licenses")
+                .update(update_data)
+                .eq("license_key", record["license_key"])
+                .execute()
+            )
+        elif record.get("hardware_id"):
+            result = (
+                supabase.table("licenses")
+                .update(update_data)
+                .eq("hardware_id", record["hardware_id"])
+                .execute()
+            )
+        elif record.get("email"):
+            result = (
+                supabase.table("licenses")
+                .update(update_data)
+                .eq("email", record["email"])
+                .execute()
+            )
+        else:
+            raise RuntimeError("Cannot update credits: license row has no id/license_key/hardware_id/email")
+
+        updated_rows = getattr(result, "data", None) or []
+        if updated_rows:
+            return updated_rows[0]
+
+        # Some Supabase/PostgREST settings may return no rows after update.
+        # In that case, return local record with the new credits so UI still updates.
+        record["ai_credits"] = new_credits
+        return record
+
+    except Exception as e:
+        log_supabase_error("update_license_credits", e)
+        if not should_use_dev_offline_fallback():
+            raise
+        record["ai_credits"] = new_credits
+        record["dev_offline"] = True
+        return record
+
+
+def refresh_ai_license_record(record):
+    """Read the charged license again from Supabase, when possible."""
+    if not record or record.get("dev_offline"):
+        return record
+
+    try:
+        if record.get("id"):
+            res = supabase.table("licenses").select("*").eq("id", record["id"]).execute()
+            rows = res.data or []
+            return rows[0] if rows else record
+        if record.get("license_key"):
+            refreshed = get_license_by_key(record["license_key"])
+            return refreshed or record
+        if record.get("hardware_id"):
+            refreshed = get_license_by_hardware(record["hardware_id"])
+            return refreshed or record
+        if record.get("email"):
+            refreshed = get_license_by_email(record["email"])
+            return refreshed or record
+    except Exception as e:
+        log_supabase_error("refresh_ai_license_record", e)
+
+    return record
 
 
 def get_ai_license(req: AIRequest):
@@ -299,23 +463,88 @@ def get_ai_license(req: AIRequest):
 
 
 def charge_ai_credits(req: AIRequest, cost: int):
+    """
+    Deduct AI credits for Stream Manager AI mode.
+
+    V15.2 behavior:
+    - license_key has priority over hardware_id;
+    - if no license exists, trial is created automatically;
+    - credits are updated in Supabase;
+    - backend returns previous_credits, credits_left and charged so the desktop UI can update immediately.
+    """
+    cost = int(cost)
     record = get_ai_license(req)
+
     if not record and req.hardware_id:
         # If AI is called before /license/status, create trial automatically.
-        status = start_trial(TrialRequest(hardware_id=req.hardware_id))
-        record = get_license_by_hardware(req.hardware_id)
+        trial_status = start_trial(TrialRequest(hardware_id=req.hardware_id, license_key=req.license_key or ""))
+        if isinstance(trial_status, dict) and trial_status.get("license_key"):
+            # Read the inserted trial again so we have id/license_key and update exactly that row.
+            record = get_license_by_key(trial_status.get("license_key")) or get_license_by_hardware(req.hardware_id)
+            if not record:
+                record = {
+                    "hardware_id": trial_status.get("hardware_id"),
+                    "email": trial_status.get("email"),
+                    "license_key": trial_status.get("license_key"),
+                    "plan": trial_status.get("plan"),
+                    "expires_at": trial_status.get("expires_at"),
+                    "is_active": trial_status.get("active", True),
+                    "max_channels": trial_status.get("max_channels", 0),
+                    "max_streams": trial_status.get("max_streams", 0),
+                    "ai_credits": trial_status.get("ai_credits", trial_status.get("credits_left", 0)),
+                    "dev_offline": bool(trial_status.get("dev_offline")),
+                }
+        else:
+            record = get_license_by_hardware(req.hardware_id)
+
     if not record:
         return None, {"error": "License not found. Press Check Credits or restart the app.", "credits_left": 0}
+
     status = build_status(record)
+
     if status.get("blocked"):
-        return None, {"error": "Subscription expired or blocked. Please upgrade your plan.", "credits_left": record.get("ai_credits", 0), "blocked": True}
+        return None, {
+            "error": "Subscription expired or blocked. Please upgrade your plan.",
+            "credits_left": int(record.get("ai_credits") or 0),
+            "blocked": True,
+        }
+
     current_credits = int(record.get("ai_credits") or 0)
+
     if current_credits < cost:
-        return None, {"error": f"Not enough AI credits. Required: {cost}, available: {current_credits}.", "credits_left": current_credits}
+        return None, {
+            "error": f"Not enough AI credits. Required: {cost}, available: {current_credits}.",
+            "credits_left": current_credits,
+            "ai_credits": current_credits,
+            "charged": 0,
+        }
+
     new_credits = current_credits - cost
-    update_license_credits(record, new_credits)
-    record["ai_credits"] = new_credits
-    return record, {"credits_left": new_credits, "ai_credits": new_credits, "charged": cost}
+    updated_record = update_license_credits(record, new_credits) or record
+    updated_record = refresh_ai_license_record(updated_record) or updated_record
+
+    verified_credits = int(updated_record.get("ai_credits") if updated_record.get("ai_credits") is not None else new_credits)
+
+    meta = {
+        "credits_left": verified_credits,
+        "ai_credits": verified_credits,
+        "previous_credits": current_credits,
+        "charged": cost,
+        "plan": updated_record.get("plan"),
+        "license_key": updated_record.get("license_key"),
+    }
+
+    if updated_record.get("dev_offline"):
+        meta["dev_offline"] = True
+        meta["warning"] = "DEV OFFLINE MODE: Supabase is unavailable, local test license is being used."
+
+    print(
+        f"AI CREDIT CHARGE OK | plan={meta.get('plan')} "
+        f"license={str(meta.get('license_key') or '')[:18]} "
+        f"cost={cost} before={current_credits} after={verified_credits}"
+    )
+
+    return updated_record, meta
 
 
 def make_demo_thumbnail_base64(title_text: str = "AI LIVESTREAM"):
@@ -403,26 +632,36 @@ def update_license_by_existing_record(existing: dict, update_data: dict):
 
 @app.post("/trial/start")
 def start_trial(req: TrialRequest):
-    existing = get_license_by_hardware(req.hardware_id)
-    if existing:
-        return build_status(existing)
-    plan = PLANS["trial"]
-    started = now_utc()
-    expires = started + timedelta(days=plan["days"])
-    data = {
-        "hardware_id": req.hardware_id,
-        "license_key": "TRIAL-" + str(uuid.uuid4()).split("-")[0].upper(),
-        "plan": "trial",
-        "trial_started_at": iso(started),
-        "expires_at": iso(expires),
-        "is_active": True,
-        "is_trial_used": True,
-        "max_channels": plan["max_channels"],
-        "max_streams": plan["max_streams"],
-        "ai_credits": plan["ai_credits"],
-    }
-    result = supabase.table("licenses").insert(data).execute()
-    return build_status(result.data[0])
+    try:
+        existing = get_license_by_hardware(req.hardware_id)
+        if existing:
+            return build_status(existing)
+
+        plan = PLANS["trial"]
+        started = now_utc()
+        expires = started + timedelta(days=plan["days"])
+
+        data = {
+            "hardware_id": req.hardware_id,
+            "license_key": "TRIAL-" + str(uuid.uuid4()).split("-")[0].upper(),
+            "plan": "trial",
+            "trial_started_at": iso(started),
+            "expires_at": iso(expires),
+            "is_active": True,
+            "is_trial_used": True,
+            "max_channels": plan["max_channels"],
+            "max_streams": plan["max_streams"],
+            "ai_credits": plan["ai_credits"],
+        }
+
+        result = supabase.table("licenses").insert(data).execute()
+        return build_status(result.data[0])
+
+    except Exception as e:
+        log_supabase_error("start_trial", e)
+        if should_use_dev_offline_fallback():
+            return build_status(make_dev_offline_license(hardware_id=req.hardware_id, email=req.email or "", license_key=req.license_key or ""))
+        raise
 
 
 @app.post("/license/status")
@@ -440,6 +679,24 @@ def license_status(req: TrialRequest):
         return start_trial(req)
 
     return build_status(record)
+
+
+@app.post("/admin/debug-license")
+def admin_debug_license(req: TrialRequest):
+    """
+    Quick admin/debug endpoint for checking the exact license row used by the app.
+    It does not change anything and does not require admin secret.
+    Use only for troubleshooting.
+    """
+    record = get_best_license_for_status(
+        email=getattr(req, "email", ""),
+        hardware_id=getattr(req, "hardware_id", ""),
+        license_key=getattr(req, "license_key", "")
+    )
+    if not record:
+        return {"found": False, "credits_left": 0}
+    status = build_status(record)
+    return {"found": True, **status}
 
 
 
