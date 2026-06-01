@@ -71,10 +71,10 @@ def log_supabase_error(place: str, error: Exception):
 app = FastAPI(title="Stream Studio Backend")
 
 PLANS = {
-    "trial": {"max_channels": 1, "max_streams": 3, "ai_credits": 30, "days": 1},
-    "starter": {"max_channels": 2, "max_streams": 10, "ai_credits": 500, "days": 30},
-    "pro": {"max_channels": 3, "max_streams": 15, "ai_credits": 3000, "days": 30},
-    "studio": {"max_channels": 4, "max_streams": 20, "ai_credits": 10000, "days": 30},
+    "trial": {"max_channels": 1, "max_streams": 3, "ai_credits": 25, "days": 1},
+    "starter": {"max_channels": 2, "max_streams": 10, "ai_credits": 300, "days": 30},
+    "pro": {"max_channels": 3, "max_streams": 15, "ai_credits": 1500, "days": 30},
+    "studio": {"max_channels": 4, "max_streams": 20, "ai_credits": 5000, "days": 30},
 }
 
 GUMROAD_PRODUCT_URLS = {
@@ -98,10 +98,13 @@ CREDIT_PACKS = {
 
 
 AI_COSTS = {
-    "generate_title": 1,
-    "generate_seo_pack": 2,
-    "generate_thumbnail_prompt": 1,
-    "generate_thumbnail_image": 5,
+    "generate_title": 3,
+    "generate_seo_pack": 10,
+    "generate_thumbnail_prompt": 7,
+    "generate_thumbnail_image": 25,
+    "auto_fill": 15,
+    "apply_to_youtube": 5,
+    "create_ai_stream": 20,
 }
 
 PLAN_PRIORITY = {"studio": 4, "pro": 3, "starter": 2, "trial": 1, None: 0, "": 0}
@@ -1081,6 +1084,30 @@ def payment_success():
 @app.get("/payment-cancel")
 def payment_cancel():
     return {"message": "Payment canceled."}
+
+
+@app.post("/charge-ai-action")
+def charge_ai_action(req: AIRequest):
+    action = str(req.prompt or "").strip().lower()
+    if action not in AI_COSTS:
+        raise HTTPException(status_code=400, detail=f"Unknown AI action: {action}")
+    record, meta = charge_ai_credits(req, AI_COSTS[action])
+    if meta.get("error"):
+        return meta
+    return {**meta, "success": True, "action": action, "message": f"Charged {AI_COSTS[action]} AI credits for {action}."}
+
+
+@app.post("/create-ai-stream-seo")
+def create_ai_stream_seo(req: AIRequest):
+    print("AI /create-ai-stream-seo", req.dict())
+    record, meta = charge_ai_credits(req, AI_COSTS["create_ai_stream"])
+    if not record:
+        return meta
+    title = "Relaxing 24/7 AI Livestream for Sleep, Study and Focus"
+    description = "Enjoy a relaxing 24/7 livestream with calming ambience, peaceful visuals, and soothing atmosphere for sleep, study, relaxation and focus."
+    tags = ["relaxing livestream", "sleep music", "study ambience", "focus music", "24/7 live", "calm ambience", "youtube live"]
+    hashtags = ["#livestream", "#sleep", "#study", "#relaxing", "#focus"]
+    return {**meta, "result": f"TITLE:\n{title}\n\nDESCRIPTION:\n{description}\n\nTAGS:\n{', '.join(tags)}\n\nHASHTAGS:\n{' '.join(hashtags)}", "title": title, "description": description, "tags": tags, "hashtags": hashtags}
 
 
 @app.post("/generate-title")
