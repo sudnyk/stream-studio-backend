@@ -7,7 +7,9 @@ from PIL import Image, ImageDraw, ImageFont
 from io import BytesIO
 from typing import Optional
 import base64
+import json
 import os
+import requests
 import uuid
 
 load_dotenv()
@@ -15,6 +17,12 @@ load_dotenv()
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
 ADMIN_SECRET_KEY = os.getenv("ADMIN_SECRET_KEY", "").strip()
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash").strip()
+GEMINI_BASE_URL = os.getenv("GEMINI_BASE_URL", "https://generativelanguage.googleapis.com/v1beta").strip().rstrip("/")
+STABILITY_API_KEY = os.getenv("STABILITY_API_KEY", "").strip()
+STABILITY_ENGINE_ID = os.getenv("STABILITY_ENGINE_ID", "stable-diffusion-xl-1024-v1-0").strip()
+AI_PROVIDER_TIMEOUT = int(os.getenv("AI_PROVIDER_TIMEOUT", "75"))
 
 if not SUPABASE_URL:
     raise RuntimeError("SUPABASE_URL is missing in .env")
@@ -66,6 +74,226 @@ def should_use_dev_offline_fallback():
 
 def log_supabase_error(place: str, error: Exception):
     print(f"[SUPABASE OFFLINE] {place}: {error}")
+
+
+def strip_json_fence(text: str):
+    raw = (text or "").strip()
+    if raw.startswith("```"):
+        raw = raw.replace("```json", "").replace("```", "").strip()
+    return raw
+
+
+def parse_json_object(text: str):
+    raw = strip_json_fence(text)
+    start = raw.find("{")
+    end = raw.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        raw = raw[start:end + 1]
+    return json.loads(raw)
+
+
+def make_seo_result(title: str, description: str, tags: list[str], hashtags: list[str]):
+    return (
+        f"TITLE:\n{title}\n\n"
+        f"DESCRIPTION:\n{description}\n\n"
+        f"TAGS:\n{', '.join(tags)}\n\n"
+        f"HASHTAGS:\n{' '.join(hashtags)}"
+    )
+
+
+def fallback_title(user_prompt: str):
+    prompt = " ".join((user_prompt or "").split()).strip()
+    if prompt:
+        return f"{prompt[:72].rstrip()} | 24/7 AI Livestream"
+    return "Relaxing 24/7 AI Livestream | Calm Ambience, Sleep, Study & Focus"
+
+
+def fallback_seo_pack(user_prompt: str):
+    title = fallback_title(user_prompt)
+    description = (
+        "Enjoy a 24/7 AI-powered YouTube livestream with polished visuals, "
+        "viewer-friendly pacing, and SEO-ready presentation for live audiences."
+    )
+    tags = [
+        "ai livestream",
+        "youtube live",
+        "24/7 live",
+        "stream manager",
+        "live automation",
+        "relaxing livestream",
+        "study ambience",
+        "sleep music",
+        "focus music",
+        "calm ambience",
+        "youtube seo",
+        "livestream setup",
+        "youtube automation",
+        "streaming tools",
+        "ai content",
+    ]
+    hashtags = ["#livestream", "#youtube", "#ai", "#streaming", "#24x7"]
+    return title, description, tags, hashtags
+
+
+def gemini_config_error():
+    if not GEMINI_API_KEY:
+        return "GEMINI_API_KEY is not configured on backend."
+    if not GEMINI_MODEL:
+        return "GEMINI_MODEL is not configured on backend."
+    return ""
+
+
+def stability_config_error():
+    if not STABILITY_API_KEY:
+        return "STABILITY_API_KEY is not configured on backend."
+    if not STABILITY_ENGINE_ID:
+        return "STABILITY_ENGINE_ID is not configured on backend."
+    return ""
+
+
+def gemini_generate_text(system_prompt: str, user_prompt: str, max_tokens: int = 900, temperature: float = 0.75):
+    error = gemini_config_error()
+    if error:
+        raise RuntimeError(error)
+
+    endpoint = f"{GEMINI_BASE_URL}/models/{GEMINI_MODEL}:generateContent"
+    full_prompt = f"{system_prompt.strip()}\n\nUSER REQUEST:\n{(user_prompt or '').strip()}"
+    payload = {
+        "contents": [
+            {
+                "role": "user",
+                "parts": [{"text": full_prompt}],
+            }
+        ],
+        "generationConfig": {
+            "temperature": temperature,
+            "maxOutputTokens": max_tokens,
+        },
+    }
+    headers = {
+        "Content-Type": "application/json",
+        "x-goog-api-key": GEMINI_API_KEY,
+    }
+
+    response = requests.post(endpoint, headers=headers, json=payload, timeout=AI_PROVIDER_TIMEOUT)
+    try:
+        data = response.json()
+    except Exception:
+        data = {"raw": response.text[:1200]}
+
+    if response.status_code >= 400:
+        raise RuntimeError(f"Gemini HTTP {response.status_code}: {data}")
+
+    parts = (
+        (data.get("candidates") or [{}])[0]
+        .get("content", {})
+        .get("parts", [])
+    )
+    text = "\n".join(str(part.get("text") or "") for part in parts).strip()
+    if not text:
+        raise RuntimeError(f"Gemini returned empty text: {data}")
+    return text
+
+
+def gemini_generate_title(user_prompt: str):
+    system_prompt = (
+        "You generate high-CTR YouTube livestream titles. "
+        "Return only plain text. No quotes. No markdown. Max 100 characters."
+    )
+    title = gemini_generate_text(system_prompt, user_prompt, max_tokens=120, temperature=0.8)
+    title = title.replace("\n", " ").strip().strip('"').strip("'")
+    return title[:100].rstrip() or fallback_title(user_prompt)
+
+
+def gemini_generate_seo_pack(user_prompt: str):
+    system_prompt = (
+        "You create YouTube SEO packs for livestreams. Return ONLY valid JSON with this exact structure: "
+        "{\"title\":\"...\",\"description\":\"...\",\"tags\":[\"tag1\",\"tag2\"],\"hashtags\":[\"#tag1\",\"#tag2\"]}. "
+        "Title max 100 characters. Description should be SEO-rich and viewer-friendly. "
+        "Tags must be 15-30 short keyword tags. Hashtags must be 3-8 hashtags. No markdown."
+    )
+    content = gemini_generate_text(system_prompt, user_prompt, max_tokens=1400, temperature=0.75)
+    data = parse_json_object(content)
+
+    title = str(data.get("title") or "").strip()[:100].rstrip()
+    description = str(data.get("description") or "").strip()
+    tags = data.get("tags") or []
+    hashtags = data.get("hashtags") or []
+    if not isinstance(tags, list):
+        tags = [str(tags)]
+    if not isinstance(hashtags, list):
+        hashtags = [str(hashtags)]
+    tags = [str(tag).strip() for tag in tags if str(tag).strip()][:30]
+    hashtags = [str(tag).strip() for tag in hashtags if str(tag).strip()][:8]
+    if not title or not description or not tags or not hashtags:
+        raise RuntimeError("Gemini SEO response missed required fields.")
+    return title, description, tags, hashtags
+
+
+def gemini_generate_thumbnail_prompt(user_prompt: str):
+    system_prompt = (
+        "You create ultra-clickable image prompts for YouTube livestream thumbnails. "
+        "Return only one Stability AI prompt. No markdown. No quotes. Mention 16:9 composition, cinematic lighting, "
+        "high contrast, and no readable text."
+    )
+    prompt = gemini_generate_text(system_prompt, user_prompt, max_tokens=240, temperature=0.85)
+    return prompt.replace("\n", " ").strip()
+
+
+def stability_generate_thumbnail_base64(user_prompt: str):
+    error = stability_config_error()
+    if error:
+        raise RuntimeError(error)
+
+    endpoint = f"https://api.stability.ai/v1/generation/{STABILITY_ENGINE_ID}/text-to-image"
+    prompt = (
+        f"{user_prompt or 'AI livestream thumbnail'}, professional YouTube livestream thumbnail, "
+        "16:9 composition, cinematic lighting, high contrast, no readable text, polished commercial style"
+    )
+    payload = {
+        "text_prompts": [{"text": prompt, "weight": 1}],
+        "cfg_scale": 7,
+        "height": 576,
+        "width": 1024,
+        "samples": 1,
+        "steps": 30,
+    }
+    headers = {
+        "Authorization": f"Bearer {STABILITY_API_KEY}",
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+    }
+
+    response = requests.post(endpoint, headers=headers, json=payload, timeout=AI_PROVIDER_TIMEOUT)
+    try:
+        data = response.json()
+    except Exception:
+        data = {"raw": response.text[:1200]}
+
+    if response.status_code >= 400:
+        raise RuntimeError(f"Stability AI HTTP {response.status_code}: {data}")
+
+    artifacts = data.get("artifacts") or []
+    if not artifacts or not artifacts[0].get("base64"):
+        raise RuntimeError(f"Stability AI returned no image artifact: {data}")
+    return artifacts[0]["base64"]
+
+
+def refund_ai_credits(record: dict, meta: dict):
+    if not record or not meta or meta.get("previous_credits") is None:
+        return meta
+    try:
+        restored = int(meta.get("previous_credits"))
+        updated = update_license_credits(record, restored) or record
+        refreshed = refresh_ai_license_record(updated) or updated
+        meta["credits_left"] = int(refreshed.get("ai_credits") or restored)
+        meta["ai_credits"] = meta["credits_left"]
+        meta["charged"] = False
+        meta["refunded"] = True
+    except Exception as e:
+        log_supabase_error("refund_ai_credits", e)
+        meta["refund_error"] = str(e)
+    return meta
 
 
 app = FastAPI(title="Stream Studio Backend")
@@ -259,6 +487,19 @@ def get_best_license_for_status(email: str = "", hardware_id: str = "", license_
     license_key = (license_key or "").strip()
     supabase_failed = False
 
+    # If the desktop app has an activated paid key, status must follow that exact
+    # license row. Otherwise duplicate hardware/email rows with more credits can
+    # make credits appear to "come back" after a Check Credits refresh.
+    try:
+        if license_key:
+            res = supabase.table("licenses").select("*").eq("license_key", license_key).execute()
+            keyed_record = choose_best_record(res.data or [])
+            if keyed_record:
+                return keyed_record
+    except Exception as e:
+        supabase_failed = True
+        log_supabase_error("get_best_license_for_status/license_key", e)
+
     try:
         if email:
             res = supabase.table("licenses").select("*").eq("email", email).execute()
@@ -274,14 +515,6 @@ def get_best_license_for_status(email: str = "", hardware_id: str = "", license_
     except Exception as e:
         supabase_failed = True
         log_supabase_error("get_best_license_for_status/hardware", e)
-
-    try:
-        if license_key:
-            res = supabase.table("licenses").select("*").eq("license_key", license_key).execute()
-            records.extend(res.data or [])
-    except Exception as e:
-        supabase_failed = True
-        log_supabase_error("get_best_license_for_status/key", e)
 
     if supabase_failed and not records and should_use_dev_offline_fallback():
         return make_dev_offline_license(
@@ -1099,55 +1332,84 @@ def charge_ai_action(req: AIRequest):
 
 @app.post("/create-ai-stream-seo")
 def create_ai_stream_seo(req: AIRequest):
-    print("AI /create-ai-stream-seo", req.dict())
+    print(f"AI /create-ai-stream-seo prompt_len={len(req.prompt or '')}")
+    config_error = gemini_config_error()
+    if config_error:
+        return {"error": config_error}
     record, meta = charge_ai_credits(req, AI_COSTS["create_ai_stream"])
     if not record:
         return meta
-    title = "Relaxing 24/7 AI Livestream for Sleep, Study and Focus"
-    description = "Enjoy a relaxing 24/7 livestream with calming ambience, peaceful visuals, and soothing atmosphere for sleep, study, relaxation and focus."
-    tags = ["relaxing livestream", "sleep music", "study ambience", "focus music", "24/7 live", "calm ambience", "youtube live"]
-    hashtags = ["#livestream", "#sleep", "#study", "#relaxing", "#focus"]
-    return {**meta, "result": f"TITLE:\n{title}\n\nDESCRIPTION:\n{description}\n\nTAGS:\n{', '.join(tags)}\n\nHASHTAGS:\n{' '.join(hashtags)}", "title": title, "description": description, "tags": tags, "hashtags": hashtags}
+    try:
+        title, description, tags, hashtags = gemini_generate_seo_pack(req.prompt)
+    except Exception as e:
+        meta = refund_ai_credits(record, meta)
+        return {**meta, "error": f"Gemini SEO generation failed: {e}"}
+    return {**meta, "result": make_seo_result(title, description, tags, hashtags), "title": title, "description": description, "tags": tags, "hashtags": hashtags, "provider": "gemini", "model": GEMINI_MODEL}
 
 
 @app.post("/generate-title")
 def generate_title(req: AIRequest):
-    print("AI /generate-title", req.dict())
+    print(f"AI /generate-title prompt_len={len(req.prompt or '')}")
+    config_error = gemini_config_error()
+    if config_error:
+        return {"error": config_error}
     record, meta = charge_ai_credits(req, AI_COSTS["generate_title"])
     if not record:
         return meta
-    title = "🔥 Relaxing 24/7 AI Livestream | Calm Ambience, Sleep, Study & Focus"
-    return {**meta, "result": title, "title": title}
+    try:
+        title = gemini_generate_title(req.prompt)
+    except Exception as e:
+        meta = refund_ai_credits(record, meta)
+        return {**meta, "error": f"Gemini title generation failed: {e}"}
+    return {**meta, "result": title, "title": title, "provider": "gemini", "model": GEMINI_MODEL}
 
 
 @app.post("/generate-seo-pack")
 def generate_seo_pack(req: AIRequest):
-    print("AI /generate-seo-pack", req.dict())
+    print(f"AI /generate-seo-pack prompt_len={len(req.prompt or '')}")
+    config_error = gemini_config_error()
+    if config_error:
+        return {"error": config_error}
     record, meta = charge_ai_credits(req, AI_COSTS["generate_seo_pack"])
     if not record:
         return meta
-    title = "Relaxing 24/7 AI Livestream for Sleep, Study and Focus"
-    description = "Enjoy a relaxing 24/7 livestream with calming ambience, peaceful visuals, and soothing atmosphere for sleep, study, relaxation and focus."
-    tags = ["relaxing livestream", "sleep music", "study ambience", "focus music", "24/7 live", "calm ambience", "youtube live"]
-    hashtags = ["#livestream", "#sleep", "#study", "#relaxing", "#focus"]
-    return {**meta, "result": f"TITLE:\n{title}\n\nDESCRIPTION:\n{description}\n\nTAGS:\n{', '.join(tags)}\n\nHASHTAGS:\n{' '.join(hashtags)}", "title": title, "description": description, "tags": tags, "hashtags": hashtags}
+    try:
+        title, description, tags, hashtags = gemini_generate_seo_pack(req.prompt)
+    except Exception as e:
+        meta = refund_ai_credits(record, meta)
+        return {**meta, "error": f"Gemini SEO generation failed: {e}"}
+    return {**meta, "result": make_seo_result(title, description, tags, hashtags), "title": title, "description": description, "tags": tags, "hashtags": hashtags, "provider": "gemini", "model": GEMINI_MODEL}
 
 
 @app.post("/generate-thumbnail-prompt")
 def generate_thumbnail_prompt(req: AIRequest):
-    print("AI /generate-thumbnail-prompt", req.dict())
+    print(f"AI /generate-thumbnail-prompt prompt_len={len(req.prompt or '')}")
+    config_error = gemini_config_error()
+    if config_error:
+        return {"error": config_error}
     record, meta = charge_ai_credits(req, AI_COSTS["generate_thumbnail_prompt"])
     if not record:
         return meta
-    prompt = "Ultra-realistic cinematic YouTube thumbnail, cozy livestream atmosphere, dramatic lighting, high contrast, eye-catching composition, no text, 16:9"
-    return {**meta, "result": prompt, "prompt": prompt, "thumbnail_prompt": prompt}
+    try:
+        prompt = gemini_generate_thumbnail_prompt(req.prompt)
+    except Exception as e:
+        meta = refund_ai_credits(record, meta)
+        return {**meta, "error": f"Gemini thumbnail prompt generation failed: {e}"}
+    return {**meta, "result": prompt, "prompt": prompt, "thumbnail_prompt": prompt, "provider": "gemini", "model": GEMINI_MODEL}
 
 
 @app.post("/generate-thumbnail-image")
 def generate_thumbnail_image(req: AIRequest):
-    print("AI /generate-thumbnail-image", req.dict())
+    print(f"AI /generate-thumbnail-image prompt_len={len(req.prompt or '')}")
+    config_error = stability_config_error()
+    if config_error:
+        return {"error": config_error}
     record, meta = charge_ai_credits(req, AI_COSTS["generate_thumbnail_image"])
     if not record:
         return meta
-    image_base64 = make_demo_thumbnail_base64(req.prompt)
-    return {**meta, "result": "Thumbnail image generated successfully.", "image_base64": image_base64, "filename": "thumbnail.png", "message": "Thumbnail image generated successfully."}
+    try:
+        image_base64 = stability_generate_thumbnail_base64(req.prompt)
+    except Exception as e:
+        meta = refund_ai_credits(record, meta)
+        return {**meta, "error": f"Stability AI thumbnail generation failed: {e}"}
+    return {**meta, "result": "Thumbnail image generated successfully.", "image_base64": image_base64, "filename": "thumbnail.png", "message": "Thumbnail image generated successfully.", "provider": "stability_ai", "model": STABILITY_ENGINE_ID}
