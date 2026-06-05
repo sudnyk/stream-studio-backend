@@ -22,6 +22,8 @@ GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash").strip()
 GEMINI_BASE_URL = os.getenv("GEMINI_BASE_URL", "https://generativelanguage.googleapis.com/v1beta").strip().rstrip("/")
 STABILITY_API_KEY = os.getenv("STABILITY_API_KEY", "").strip()
 STABILITY_ENGINE_ID = os.getenv("STABILITY_ENGINE_ID", "stable-diffusion-xl-1024-v1-0").strip()
+STABILITY_IMAGE_WIDTH = int(os.getenv("STABILITY_IMAGE_WIDTH", "1344") or "1344")
+STABILITY_IMAGE_HEIGHT = int(os.getenv("STABILITY_IMAGE_HEIGHT", "768") or "768")
 AI_PROVIDER_TIMEOUT = int(os.getenv("AI_PROVIDER_TIMEOUT", "75"))
 
 if not SUPABASE_URL:
@@ -253,8 +255,8 @@ def stability_generate_thumbnail_base64(user_prompt: str):
     payload = {
         "text_prompts": [{"text": prompt, "weight": 1}],
         "cfg_scale": 7,
-        "height": 576,
-        "width": 1024,
+        "height": STABILITY_IMAGE_HEIGHT,
+        "width": STABILITY_IMAGE_WIDTH,
         "samples": 1,
         "steps": 30,
     }
