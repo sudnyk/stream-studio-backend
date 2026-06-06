@@ -359,12 +359,14 @@ class AdminGrantPlanRequest(BaseModel):
     days: int = 30
     ai_credits: int | None = None
 
+    order_id: str = ""
 
 class AdminAddCreditsRequest(BaseModel):
     admin_secret: str
     email: str
     credits: int
 
+    order_id: str = ""
 
 class AdminExtendLicenseRequest(BaseModel):
     admin_secret: str
@@ -944,6 +946,14 @@ def admin_grant_plan(req: AdminGrantPlanRequest):
     email = normalize_email(req.email)
     plan = normalize_plan(req.plan)
 
+    order_id = (req.order_id or "").strip()
+    if order_id:
+        processed = supabase.table("licenses").select("*").eq("gumroad_sale_id", order_id).execute()
+        rows = processed.data or []
+        if rows:
+            r = rows[0]
+            return {"status": "already_processed", "action": "no_change", "email": email, "license_key": r.get("license_key"), "plan": r.get("plan"), "expires_at": r.get("expires_at"), "ai_credits": r.get("ai_credits", 0), "credits_after": r.get("ai_credits", 0), "max_channels": r.get("max_channels", 0), "max_streams": r.get("max_streams", 0), "order_id": order_id}
+
     days = int(req.days or 30)
     if days <= 0:
         raise HTTPException(status_code=400, detail="days must be greater than 0")
@@ -981,7 +991,7 @@ def admin_grant_plan(req: AdminGrantPlanRequest):
         "max_channels": int(plan_config.get("max_channels", 1)),
         "max_streams": int(plan_config.get("max_streams", 1)),
         "gumroad_subscription_id": f"MANUAL-{uuid.uuid4().hex[:10].upper()}",
-        "gumroad_sale_id": f"ADMIN-GRANT-{uuid.uuid4().hex[:10].upper()}",
+        "gumroad_sale_id": order_id or f"ADMIN-GRANT-{uuid.uuid4().hex[:10].upper()}",
         "last_payment_at": iso(now),
     }
 
@@ -1018,6 +1028,14 @@ def admin_add_credits(req: AdminAddCreditsRequest):
     if credits_to_add <= 0:
         raise HTTPException(status_code=400, detail="credits must be greater than 0")
 
+    order_id = (req.order_id or "").strip()
+    if order_id:
+        processed = supabase.table("licenses").select("*").eq("gumroad_sale_id", order_id).execute()
+        rows = processed.data or []
+        if rows:
+            r = rows[0]
+            return {"status": "already_processed", "email": email, "added_credits": 0, "credits_left": r.get("ai_credits", 0), "order_id": order_id}
+
     existing = admin_get_license_by_email_or_error(email)
 
     current_credits = int(existing.get("ai_credits") or 0)
@@ -1025,7 +1043,7 @@ def admin_add_credits(req: AdminAddCreditsRequest):
 
     update_data = {
         "ai_credits": new_credits,
-        "gumroad_sale_id": f"ADMIN-CREDITS-{uuid.uuid4().hex[:10].upper()}",
+        "gumroad_sale_id": order_id or f"ADMIN-CREDITS-{uuid.uuid4().hex[:10].upper()}",
         "last_payment_at": iso(now_utc()),
     }
 
