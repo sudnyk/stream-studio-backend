@@ -498,8 +498,7 @@ def get_best_license_for_status(email: str = "", hardware_id: str = "", license_
         if license_key:
             res = supabase.table("licenses").select("*").eq("license_key", license_key).execute()
             keyed_record = choose_best_record(res.data or [])
-            if keyed_record:
-                return keyed_record
+            return keyed_record
     except Exception as e:
         supabase_failed = True
         log_supabase_error("get_best_license_for_status/license_key", e)
@@ -915,6 +914,21 @@ def license_status(req: TrialRequest):
     )
 
     if not record:
+        if str(getattr(req, "license_key", "") or "").strip():
+            return {
+                "active": False,
+                "blocked": True,
+                "reason": "KEY_NOT_FOUND",
+                "plan": "none",
+                "expires_at": None,
+                "max_channels": 0,
+                "max_streams": 0,
+                "ai_credits": 0,
+                "credits_left": 0,
+                "email": None,
+                "hardware_id": getattr(req, "hardware_id", ""),
+                "license_key": None,
+            }
         return start_trial(req)
 
     return build_status(record)
@@ -978,7 +992,11 @@ def admin_grant_plan(req: AdminGrantPlanRequest):
 
     credits = current_credits + credits_to_add
 
-    license_key = f"ADMIN-{plan.upper()}-{uuid.uuid4().hex[:12].upper()}"
+    license_key = (
+        str(existing.get("license_key") or "").strip()
+        if existing
+        else ""
+    ) or f"ADMIN-{plan.upper()}-{uuid.uuid4().hex[:12].upper()}"
 
     data = {
         "email": email,
