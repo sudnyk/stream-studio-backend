@@ -1201,6 +1201,11 @@ def admin_reset_license_by_hardware(req: AdminResetHardwareRequest):
 
 @app.post("/billing/create-checkout")
 def create_checkout(req: CheckoutRequest):
+    raise HTTPException(
+        status_code=410,
+        detail="Purchases are available only through the Telegram bot",
+    )
+
     plan = req.plan.lower().strip()
 
     allowed_products = ["starter", "pro", "studio", "credits_1000", "credits_5000", "credits_15000"]
@@ -1282,6 +1287,11 @@ def add_credit_pack_to_license(email: str, add_credits: int, sale_id: str):
 
 @app.post("/webhooks/gumroad")
 async def gumroad_webhook(request: Request):
+    raise HTTPException(
+        status_code=410,
+        detail="Gumroad integration is disabled; purchases use the Telegram bot",
+    )
+
     form = await request.form()
     data = dict(form)
     print("GUMROAD WEBHOOK:", data)
