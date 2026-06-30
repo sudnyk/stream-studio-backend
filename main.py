@@ -976,7 +976,7 @@ def admin_grant_plan(req: AdminGrantPlanRequest):
     existing = get_license_by_email(email)
 
     now = now_utc()
-    expires_at = now + timedelta(days=days)
+    expires_at = calculate_new_expiration(existing, days)
 
     # V15.2C FIX:
     # When a user buys/upgrades a plan, plan credits must be ADDED to remaining credits,
