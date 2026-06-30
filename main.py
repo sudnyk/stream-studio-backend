@@ -976,7 +976,13 @@ def admin_grant_plan(req: AdminGrantPlanRequest):
     existing = get_license_by_email(email)
 
     now = now_utc()
-    expires_at = calculate_new_expiration(existing, days)
+    existing_plan = normalize_plan(existing.get("plan")) if existing else ""
+    if existing and existing_plan == plan:
+        expires_at = calculate_new_expiration(existing, days)
+    else:
+        # A plan change starts a fresh billing period. Only renewal of the same
+        # plan extends unused paid time.
+        expires_at = now + timedelta(days=days)
 
     # V15.2C FIX:
     # When a user buys/upgrades a plan, plan credits must be ADDED to remaining credits,
